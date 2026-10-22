@@ -1,0 +1,714 @@
+# Helm Hydration (Gitea)
+#
+# Gitea Actions variant of helm-hydration.yaml in steadforce/steadops-workflows, based on v4.3.0.
+# It discovers the charts in the repository, reads the environments of each chart from its
+# `helm-config.yaml`, renders environment-specific Kubernetes manifests using `helm template`,
+# and opens a version-aware pull request per chart and environment whose manifests changed.
+# Optionally, patch-level subchart updates are bundled into a single PR by replacing the patch
+# segment of the version with "x".
+#
+# Discovery, `helm-config.yaml`, rendering, the CRD annotations, the manifest layout and the
+# branch and pull request names are the same as upstream, so a repository can be hydrated by
+# either variant. Port changes of those parts from upstream as they are.
+#
+# Differences from upstream
+# -------------------------
+#   • One job renders, compares and opens the pull requests, so no artifacts and no dynamic
+#     matrix are needed: upload-artifact v4 and later refuse to run on Gitea. The step "Create
+#     pull requests" replaces upstream's create-pull-request job, and like its matrix jobs, a pair
+#     that fails doesn't stop the others.
+#   • Labels and pull requests go through Gitea's API instead of gh and
+#     peter-evans/create-pull-request, which only work with GitHub. Gitea doesn't create labels
+#     when they are applied, so all of them are created up front.
+#   • A pull request whose manifests match the environment branch again is closed.
+#   • No `upload-artifact` input.
+#
+# Like upstream it runs on the runner's `ubuntu-latest` image, uses actions/checkout and
+# azure/setup-helm, and takes yq, jq and curl from the image, e.g. gitea/runner-images. The
+# runner loads the actions from github.com, and setup-helm downloads Helm from get.helm.sh.
+#
+# Gitea specifics (tested with Gitea 1.24.5 and its runner v0.4.1)
+# -------------------------------------------------------------------
+#   • Reference this workflow by tag. The runner caches a called workflow by its ref and doesn't
+#     fetch `@main` again, so a branch ref keeps running an old version.
+#   • The runner runs steps with sh unless told otherwise, hence `shell: bash`.
+#   • A boolean input set by an expression in the caller arrives as a string, hence the explicit
+#     comparison of `create-pull-request`.
+#   • Gitea logs "ignore invalid workflow helm-hydration.yaml" for this repository: it doesn't
+#     recognise `workflow_call` inputs as a trigger of this repository's own, which is harmless.
+#
+# Expected repository layout
+# --------------------------
+# Every directory containing a `helm-config.yaml` is treated as a chart and must also hold
+# `Chart.yaml`, and should hold `Chart.lock`. With the default inputs only the repository root
+# is searched, which is the one-chart-per-repository layout.
+#
+#   helm-config.yaml  – Must contain:
+#                         • A top-level `environments` map whose keys are the target
+#                           environment names, e.g. `dev`, `prod`
+#                         • A top-level `releaseName` (string, required)
+#                         • A top-level `namespace`   (string, required)
+#                         • Per-environment `apis` and `valueFiles` lists
+#                         • An optional `primaryDependency` naming the subchart whose version
+#                           identifies the chart
+#
+# Output
+# ------
+#   hydrated-manifests/  – Directory tree written by helm template on the branch
+#                          `environments/<name>`. Charts sharing an environment branch each own
+#                          `hydrated-manifests/<chart name>`.
+#   Pull request         – One PR per changed chart and environment targeting
+#                          `environments/<name>`, from `hydration-pull-request/<name>[-<chart>]-<version>`.
+#
+# Token
+# -----
+# The token needs to push branches, and to create labels and pull requests. Gitea 1.24's job token
+# may push and create labels, but not open pull requests ("user must be a collaborator"), so pass
+# the token of a bot user with write access to the repository as the `token` secret there. From
+# Gitea 28 on (tested with 28.2.0) the job token opens pull requests itself, and the secret can be
+# left out.
+
+name: Helm hydration
+
+on:
+  workflow_call:
+    inputs:
+      helm-version:
+        # Helm version to install. Pin to a specific version (e.g. "v3.17.0") for reproducible
+        # builds.
+        default: "latest"
+        description: "Helm version eg v3.17.0, defaults to latest."
+        type: string
+      bundle-patches-in-one-pr:
+        description: "Bundle patch level chart updates in one pr/branch."
+        default: "true"
+        type: string
+      charts-root:
+        description: "Directory to search for charts, defaults to the repository root."
+        default: "."
+        type: string
+      chart-discovery-depth:
+        description: "Maximum search depth for helm-config.yaml below charts-root."
+        default: 1
+        type: number
+      create-pull-request:
+        # When false the workflow renders the manifests and stops. Nothing is pushed and no
+        # environment branch is created, which makes it usable as a validation step on pull
+        # requests.
+        description: "Push the hydrated manifests to the environment branch and open a pull request."
+        default: true
+        type: boolean
+    secrets:
+      token:
+        description: "Token to push and to open pull requests with, defaults to the job token."
+        required: false
+
+jobs:
+  hydrate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    defaults:
+      run:
+        # Gitea's runner defaults to sh, the steps need bash
+        shell: bash
+    env:
+      TOKEN: ${{ secrets.token || github.token }}
+      SERVER_URL: ${{ github.server_url }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+    - name: Checkout repository
+      # With the token that later pushes the environment and pull request branches, since
+      # checkout keeps it configured for git
+      uses: actions/checkout@v7
+      with:
+        token: ${{ secrets.token || github.token }}
+    - name: Discover charts
+      # A directory is a chart when it holds a helm-config.yaml. The sorted list is what the
+      # render step iterates over, so the output order does not depend on the order in which the
+      # filesystem returns directories.
+      id: discover
+      env:
+        CHARTS_ROOT: ${{ inputs.charts-root }}
+        DISCOVERY_DEPTH: ${{ inputs.chart-discovery-depth }}
+      run: |
+        set -euo pipefail
+        # Paths shared by the steps below. They live outside the checkout, so nothing rendered
+        # here can end up in a commit by accident.
+        CHART_LIST="$RUNNER_TEMP/charts.txt"
+        {
+          echo "CHART_LIST=$CHART_LIST"
+          echo "OUTPUT_ROOT=$RUNNER_TEMP/hydrated"
+          echo "PAIRS_FILE=$RUNNER_TEMP/hydrated-pairs.jsonl"
+        } >> "$GITHUB_ENV"
+        configs=()
+        while IFS= read -r -d '' config; do
+          configs+=("$config")
+        done < <(find "$CHARTS_ROOT" -maxdepth "$DISCOVERY_DEPTH" -name helm-config.yaml -print0 | sort -z)
+        if [ "${#configs[@]}" -eq 0 ]; then
+          echo "::error::No helm-config.yaml found below '$CHARTS_ROOT' within depth $DISCOVERY_DEPTH."
+          exit 1
+        fi
+        for config in "${configs[@]}"; do
+          dirname "$config"
+        done > "$CHART_LIST"
+        echo "Found ${#configs[@]} chart(s):"
+        cat "$CHART_LIST"
+        multi_chart=false
+        if [ "${#configs[@]}" -gt 1 ]; then
+          multi_chart=true
+        fi
+        echo "multi-chart=$multi_chart" >> "$GITHUB_OUTPUT"
+    - name: Set up Helm
+      # Installs the Helm CLI at the version requested via the workflow input. Pinning to a
+      # specific version (e.g. "v3.17.0") ensures reproducible builds.
+      uses: azure/setup-helm@v5.0.1
+      with:
+        version: ${{ inputs.helm-version }}
+    - name: Verify tools
+      # Prints the versions to the job log. yq and jq come from the runner image, so they are
+      # traceable in CI output too.
+      run: |
+        helm version
+        yq --version
+        jq --version
+    - name: Hydrate
+      # Same as upstream: installs the dependencies of every chart once and renders it for each
+      # of its environments into `$OUTPUT_ROOT/hydrated-<chart>-<environment>`, which holds
+      # exactly what ends up in the chart's manifest directory on the environment branch. Every
+      # rendered pair is recorded as one JSON line in $PAIRS_FILE.
+      #
+      # Variables read from helm-config.yaml:
+      #   releaseName  – Helm release name (required).
+      #   namespace    – Kubernetes namespace (required).
+      #   apis         – Additional Kubernetes API groups passed via `-a` to enable conditional
+      #                  rendering of resources that depend on CRDs or optional APIs.
+      #   valueFiles   – Values files for the current environment, passed via `-f`. The paths
+      #                  are relative to the chart directory.
+      id: hydrate
+      env:
+        MULTI_CHART: ${{ steps.discover.outputs.multi-chart }}
+        BUNDLE_PATCHES: ${{ inputs.bundle-patches-in-one-pr }}
+        REGISTERED_REPOSITORIES: ${{ runner.temp }}/helm-repositories.txt
+      run: |
+        set -uo pipefail
+
+        # Installs the subcharts of one chart into its charts/ directory and writes the metadata
+        # the render and publish steps need to $2.
+        prepare_chart() {
+          local chart_dir=$1 metadata_file=$2
+          local config="$chart_dir/helm-config.yaml"
+
+          # `helm dependency build` resolves https repositories against the local repository
+          # list rather than by URL, and a runner starts with none registered. Every http(s)
+          # repository the chart declares is added first, once per run, under a name derived
+          # from the URL. oci:// and file:// dependencies need no entry, and an alias refers to
+          # a repository that has to be registered already, so both are left to Helm.
+          local dep_url
+          while IFS= read -r dep_url; do
+            case "$dep_url" in
+              http://*|https://*) ;;
+              *) continue ;;
+            esac
+            if grep -qxF "$dep_url" "$REGISTERED_REPOSITORIES" 2> /dev/null; then
+              continue
+            fi
+            helm repo add "repo-$(printf '%s' "$dep_url" | sha256sum | cut -c1-12)" "$dep_url" --force-update > /dev/null
+            printf '%s\n' "$dep_url" >> "$REGISTERED_REPOSITORIES"
+          done < <(yq -N -r 'explode(.) | .dependencies[]? | .repository' "$chart_dir/Chart.yaml")
+          if [ -f "$chart_dir/Chart.lock" ]; then
+            # The committed lock file decides which versions are installed, which makes the
+            # rendered manifests a function of the commit alone.
+            helm dependency build --skip-refresh "$chart_dir"
+          else
+            echo "::warning::$chart_dir/Chart.lock is not committed, so the subchart versions are resolved now rather than by the repository, and an upstream release can change the rendered manifests without a commit. Run 'helm dependency update' and commit the lock file."
+            helm dependency update --skip-refresh "$chart_dir"
+          fi
+
+          local chart_name release_name namespace
+          chart_name=$(yq 'explode(.) | .name' "$chart_dir/Chart.yaml")
+          release_name=$(yq 'explode(.) | .releaseName // ""' "$config")
+          namespace=$(yq 'explode(.) | .namespace // ""' "$config")
+          if [ -z "$release_name" ]; then
+            echo "::error::releaseName is required in $config"
+            return 1
+          fi
+          if [ -z "$namespace" ]; then
+            echo "::error::namespace is required in $config"
+            return 1
+          fi
+
+          # A repository holding a single chart owns the whole hydrated-manifests directory.
+          # Charts sharing an environment branch each own a sub-directory of it and carry their
+          # name in the PR branch.
+          local manifest_dir branch_suffix
+          if [ "$MULTI_CHART" = "true" ]; then
+            manifest_dir="hydrated-manifests/$chart_name"
+            branch_suffix="-$chart_name"
+          else
+            manifest_dir="hydrated-manifests"
+            branch_suffix=""
+          fi
+
+          # The primary dependency is the subchart whose version identifies this chart. It
+          # defaults to the dependency sharing the chart's own name.
+          local dep_name version
+          dep_name=$(yq 'explode(.) | .primaryDependency // ""' "$config")
+          if [ -z "$dep_name" ]; then
+            dep_name=$chart_name
+          fi
+          if [ -f "$chart_dir/Chart.lock" ]; then
+            version=$(DEP_NAME=$dep_name yq '.dependencies[] | select(.name == strenv(DEP_NAME)) | .version' "$chart_dir/Chart.lock")
+            if [ -z "$version" ]; then
+              echo "::error::Dependency '$dep_name' is not listed in $chart_dir/Chart.lock. Set 'primaryDependency' in helm-config.yaml to name the subchart that identifies this chart."
+              return 1
+            fi
+          else
+            # A chart without dependencies has no lock file, so its own version identifies it.
+            version=$(yq 'explode(.) | .version' "$chart_dir/Chart.yaml")
+          fi
+          if [ "$BUNDLE_PATCHES" = "true" ]; then
+            # Replace the patch segment with "x" to bundle patch updates in one PR.
+            version=$(echo "$version" | cut -d. -f1,2).x
+          fi
+
+          jq -n \
+            --arg chart_dir "$chart_dir" \
+            --arg name "$chart_name" \
+            --arg release_name "$release_name" \
+            --arg namespace "$namespace" \
+            --arg manifest_dir "$manifest_dir" \
+            --arg branch_suffix "$branch_suffix" \
+            --arg version "$version" \
+            '{"chart-dir": $chart_dir, name: $name, "release-name": $release_name, namespace: $namespace,
+              "manifest-dir": $manifest_dir, "branch-suffix": $branch_suffix, version: $version}' \
+            > "$metadata_file"
+        }
+
+        # Renders one chart for one environment into $4.
+        render_environment() {
+          local chart_dir=$1 release_name=$2 namespace=$3 output_dir=$4 hydration=$5
+          local config="$chart_dir/helm-config.yaml"
+          local apis value_files
+          apis=$(hydration=$hydration yq 'explode(.) | (.environments.[env(hydration)].apis // []) | @csv' "$config")
+          value_files=$(hydration=$hydration chart_dir=$chart_dir yq 'explode(.) | (.environments.[env(hydration)].valueFiles // []) | map(env(chart_dir) + "/" + .) | @csv' "$config")
+          local helm_args=()
+          if [ -n "$apis" ]; then
+            helm_args+=(-a "$apis")
+          fi
+          if [ -n "$value_files" ]; then
+            helm_args+=(-f "$value_files")
+          fi
+          helm template "$release_name" "$chart_dir" \
+            "${helm_args[@]}" \
+            -n "$namespace" \
+            --output-dir "$output_dir" \
+            --include-crds \
+            --release-name \
+            --skip-tests
+          # CRDs are applied by Argo CD with server-side apply, which avoids the size limit of the
+          # last-applied annotation, and in sync wave -1, before the resources that use them.
+          find "$output_dir" -type f \( -name "*.yaml" -o -name "*.yml" \) -exec yq -i '
+            select(.kind == "CustomResourceDefinition" and
+              .metadata.annotations["argocd.argoproj.io/sync-options"] == null)
+              .metadata.annotations["argocd.argoproj.io/sync-options"] = "ServerSideApply=true" |
+            select(.kind == "CustomResourceDefinition" and .metadata.annotations["argocd.argoproj.io/sync-options"] != null and
+              (.metadata.annotations["argocd.argoproj.io/sync-options"] |
+              contains("ServerSideApply=") | not))
+              .metadata.annotations["argocd.argoproj.io/sync-options"] |= . + ",ServerSideApply=true" |
+            select(.kind == "CustomResourceDefinition" and .metadata.annotations["argocd.argoproj.io/sync-wave"] == null)
+              .metadata.annotations["argocd.argoproj.io/sync-wave"] = "-1"
+          ' {} \;
+        }
+
+        # A failing chart or environment must not stop the others. The functions therefore run
+        # in a child bash with errexit enabled: bash ignores errexit inside a function that is
+        # called as the condition of an `if`, but not inside a new process started from there.
+        export -f prepare_chart render_environment
+        run() {
+          bash -euo pipefail -c '"$@"' _ "$@" < /dev/null
+        }
+
+        mkdir -p "$OUTPUT_ROOT"
+        : > "$PAIRS_FILE"
+        metadata="$RUNNER_TEMP/chart-metadata.json"
+        failed=()
+        while IFS= read -r chart_dir; do
+          echo "::group::Install the dependencies of $chart_dir"
+          if ! run prepare_chart "$chart_dir" "$metadata"; then
+            echo "::endgroup::"
+            echo "::error::Could not install the dependencies of $chart_dir, none of its environments was hydrated."
+            failed+=("$chart_dir")
+            continue
+          fi
+          echo "::endgroup::"
+          chart_name=$(jq -r '.name' "$metadata")
+          release_name=$(jq -r '."release-name"' "$metadata")
+          namespace=$(jq -r '.namespace' "$metadata")
+          while IFS= read -r environment; do
+            source="hydrated-$chart_name-$environment"
+            echo "::group::Hydrate $chart_name for $environment"
+            if run render_environment "$chart_dir" "$release_name" "$namespace" "$OUTPUT_ROOT/$source" "$environment"; then
+              echo "::endgroup::"
+              jq -c --arg env "$environment" --arg source "$source" \
+                '. + {env: $env, source: $source, branch: ("hydration-pull-request/" + $env + ."branch-suffix" + "-" + .version)}' \
+                "$metadata" >> "$PAIRS_FILE"
+            else
+              echo "::endgroup::"
+              echo "::error::Could not hydrate $chart_dir for $environment."
+              rm -rf "${OUTPUT_ROOT:?}/$source"
+              failed+=("$chart_dir ($environment)")
+            fi
+          done < <(yq -r 'explode(.) | .environments | keys | .[]' "$chart_dir/helm-config.yaml")
+        done < "$CHART_LIST"
+
+        hydrated=false
+        if [ -s "$PAIRS_FILE" ]; then
+          hydrated=true
+        fi
+        echo "hydrated=$hydrated" >> "$GITHUB_OUTPUT"
+        echo "Hydrated $(wc -l < "$PAIRS_FILE") chart/environment pair(s)."
+        if [ "${#failed[@]}" -gt 0 ]; then
+          printf '::error::Hydration failed for %s\n' "${failed[@]}"
+          exit 1
+        fi
+    - name: Prepare environment branches
+      # Ensures the `environments/<name>` branch exists on origin before any chart is hydrated
+      # into it, creating it as an orphan branch on first use, and that the labels exist. Gitea
+      # doesn't create a label when it is applied, so all of them are created here, the
+      # environment label with a colour for its tier.
+      #
+      # Also writes the Gitea API helpers and the git identity the next steps use.
+      #
+      # An environment whose branch can't be created fails this step at the end, and its charts
+      # are skipped by the next steps. A label that can't be created only warns.
+      #
+      # Gitea's runner passes a boolean input set by an expression in the caller, such as
+      # `${{ github.event_name == 'push' }}`, as the string "false", which is truthy on its own,
+      # hence the explicit comparison of `create-pull-request`.
+      id: prepare
+      if: ${{ !cancelled() && steps.hydrate.outputs.hydrated == 'true' && (inputs.create-pull-request == true || inputs.create-pull-request == 'true') }}
+      env:
+        ACTOR: ${{ github.actor }}
+      run: |
+        set -euo pipefail
+
+        cat > "$RUNNER_TEMP/gitea-api.sh" <<'HELPERS'
+        API="$SERVER_URL/api/v1/repos/$REPOSITORY"
+
+        # Calls Gitea's API and prints the response. Fails with Gitea's message on an error status.
+        api() {
+          local method=$1 path=$2 response status
+          shift 2
+          response=$(curl --silent --show-error -X "$method" -w '\n%{http_code}' \
+            -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+            "$API$path" "$@")
+          status=${response##*$'\n'}
+          response=${response%$'\n'*}
+          if [[ $status != 2* ]]; then
+            echo "::error::$method $path returned $status: $response" >&2
+            return 1
+          fi
+          printf '%s' "$response"
+        }
+
+        # Fetches every page of a list endpoint as one JSON array.
+        api_list() {
+          local path=$1 separator='?' page=1 result='[]' items
+          if [[ $path == *\?* ]]; then
+            separator='&'
+          fi
+          while :; do
+            items=$(api GET "$path${separator}limit=50&page=$page")
+            if [ "$(jq 'length' <<< "$items")" -eq 0 ]; then
+              break
+            fi
+            result=$(jq -c --argjson items "$items" '. + $items' <<< "$result")
+            page=$((page + 1))
+          done
+          printf '%s' "$result"
+        }
+        HELPERS
+        # shellcheck source=/dev/null
+        source "$RUNNER_TEMP/gitea-api.sh"
+
+        # Same colours as upstream: the tier read from the name's segments chooses the colour
+        # family, so "is this production" is answerable from the colour alone, and the number in
+        # the name or a hash of it chooses the shade.
+        environment_colour() {
+          local environment=$1 segments segment rank=0
+          segments=$(printf '%s' "$environment" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' ' ')
+          for segment in $segments; do
+            case "$segment" in
+              prod|prod[0-9]*|production|live|prd)  if [ "$rank" -lt 5 ]; then rank=5; fi ;;
+              stage|staging|stg|preprod|uat)        if [ "$rank" -lt 4 ]; then rank=4; fi ;;
+              test|test[0-9]*|testing|qa|int)       if [ "$rank" -lt 3 ]; then rank=3; fi ;;
+              dev|dev[0-9]*|develop|development)    if [ "$rank" -lt 2 ]; then rank=2; fi ;;
+              local|localhost|sandbox|demo|kind|minikube)
+                                                    if [ "$rank" -lt 1 ]; then rank=1; fi ;;
+            esac
+          done
+          local family
+          case "$rank" in
+            5) family=(b60205 d73a4a cf222e a40e26 e5534b 8e1519) ;;  # production, red
+            4) family=(d93f0b e36209 bf5b04 c2410c ea7317 fb8500) ;;  # staging, orange
+            3) family=(1d76db 0052cc 218bff 0366d6 0a3069 4184e4) ;;  # test, blue
+            2) family=(0e8a16 2ea043 1a7f37 3fb950 116329 57ab5a) ;;  # development, green
+            1) family=(6e7781 57606a 424a53 8c959f 795548 4d5358) ;;  # throwaway, grey
+            *) family=(5319e7 006b75 8250df bf3989 9a6700 1b7c83) ;;  # unrecognised
+          esac
+          local digits index
+          digits=$(printf '%s' "$environment" | tr -cd '0-9' | tail -c 6)
+          if [ -n "$digits" ]; then
+            index=$(( 10#$digits % ${#family[@]} ))
+          else
+            index=$(( 0x$(printf '%s' "$environment" | sha256sum | cut -c1-4) % ${#family[@]} ))
+          fi
+          printf '%s' "${family[$index]}"
+        }
+
+        # Label ids by name. An existing label is left alone, so a recoloured one keeps its colour.
+        declare -A labels=()
+        while IFS=$'\t' read -r id name; do
+          labels[$name]=$id
+        done < <(api_list "/labels" | jq -r '.[] | [.id, .name] | @tsv')
+        ensure_label() {
+          local name=$1 colour=$2 description=$3 id
+          if [ -n "${labels[$name]:-}" ]; then
+            return 0
+          fi
+          if id=$(api POST /labels -d "$(jq -n --arg name "$name" --arg color "#$colour" \
+              --arg description "$description" '{name: $name, color: $color, description: $description}')" |
+              jq -er '.id'); then
+            labels[$name]=$id
+            echo "Created label '$name' in #$colour."
+          else
+            echo "::warning::Could not create the label '$name', pull requests are opened without it."
+          fi
+        }
+        ensure_label "hydration" "0075ca" "Hydrated manifests"
+        ensure_label "automated pr" "ededed" "Opened by a workflow"
+
+        # The git identity of the commits, for this and the next steps
+        host=${SERVER_URL#*://}
+        host=${host%%/*}
+        export GIT_AUTHOR_NAME="$ACTOR" GIT_COMMITTER_NAME="$ACTOR"
+        export GIT_AUTHOR_EMAIL="$ACTOR@noreply.${host%%:*}" GIT_COMMITTER_EMAIL="$ACTOR@noreply.${host%%:*}"
+        {
+          echo "GIT_AUTHOR_NAME=$GIT_AUTHOR_NAME"
+          echo "GIT_COMMITTER_NAME=$GIT_COMMITTER_NAME"
+          echo "GIT_AUTHOR_EMAIL=$GIT_AUTHOR_EMAIL"
+          echo "GIT_COMMITTER_EMAIL=$GIT_COMMITTER_EMAIL"
+        } >> "$GITHUB_ENV"
+
+        # An orphan commit with an empty tree gives the hydrated manifests a clean history
+        # separate from the branch the chart sources live on. The environments whose branch
+        # exists are written to $RUNNER_TEMP/environments.txt for the next steps.
+        failed=()
+        : > "$RUNNER_TEMP/environments.txt"
+        empty_tree=$(git mktree < /dev/null)
+        while IFS= read -r environment; do
+          branch="environments/$environment"
+          if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null 2>&1; then
+            echo "Branch '$branch' already exists on origin."
+          else
+            commit=$(git commit-tree "$empty_tree" -m "chore: initialise $branch branch")
+            # A concurrent run may have created the branch in the meantime, which rejects this
+            # push but leaves the branch in place.
+            if ! git push --quiet origin "$commit:refs/heads/$branch" < /dev/null \
+                && ! git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null 2>&1; then
+              echo "::error::Could not create the branch '$branch', none of its charts is published."
+              failed+=("$branch")
+              continue
+            fi
+          fi
+          echo "$environment" >> "$RUNNER_TEMP/environments.txt"
+          ensure_label "env: $environment" "$(environment_colour "$environment")" \
+            "Hydrated manifests for the $environment environment"
+        done < <(jq -r '.env' "$PAIRS_FILE" | sort -u)
+
+        # Label ids by name, for the pull requests
+        for name in "${!labels[@]}"; do
+          jq -n --arg name "$name" --argjson id "${labels[$name]}" '{($name): $id}'
+        done | jq -s 'add // {}' > "$RUNNER_TEMP/labels.json"
+
+        if [ "${#failed[@]}" -gt 0 ]; then
+          printf '::error::Could not create the branch %s\n' "${failed[@]}"
+          exit 1
+        fi
+    - name: Select pull requests
+      # Keeps the chart/environment pairs whose rendered manifests differ from what is already
+      # proposed or deployed:
+      #   • With an open pull request for the pair's branch, the manifests are compared against
+      #     that branch. The pull request is also refreshed when its branch no longer builds on
+      #     the tip of the environment branch.
+      #   • Without one, they are compared against the environment branch.
+      #
+      # The comparison is between git tree hashes, computed for the rendered directory with a
+      # throwaway index, so no file is copied or checked out. The selected pairs are written to
+      # $RUNNER_TEMP/pull-requests.jsonl, with the number of their open pull request.
+      #
+      # Runs even when Prepare environment branches failed, for the environments it prepared.
+      id: select
+      if: ${{ !cancelled() && steps.hydrate.outputs.hydrated == 'true' && (inputs.create-pull-request == true || inputs.create-pull-request == 'true') }}
+      run: |
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$RUNNER_TEMP/gitea-api.sh"
+        mapfile -t environments < "$RUNNER_TEMP/environments.txt"
+
+        # Open pull requests by head branch: the branch they target and their number
+        declare -A open_prs=() open_pr_numbers=()
+        while IFS=$'\t' read -r head base number; do
+          open_prs[$head]=$base
+          open_pr_numbers[$head]=$number
+        done < <(api_list "/pulls?state=open" | jq -r '.[] | [.head.ref, .base.ref, .number] | @tsv')
+
+        # One fetch for every environment branch and every open pull request branch. A pull
+        # request branch is one commit ahead of its base, so a short history is enough to find
+        # the base tip in it. Should it not be found, the pull request is refreshed.
+        refspecs=()
+        for environment in ${environments[@]+"${environments[@]}"}; do
+          refspecs+=("+refs/heads/environments/$environment:refs/remotes/origin/environments/$environment")
+        done
+        for head in "${!open_prs[@]}"; do
+          case "$head" in
+            hydration-pull-request/*) refspecs+=("+refs/heads/$head:refs/remotes/origin/$head") ;;
+          esac
+        done
+        if [ "${#refspecs[@]}" -gt 0 ]; then
+          git fetch --quiet --no-tags --depth=10 origin "${refspecs[@]}"
+        fi
+
+        git_dir=$(git rev-parse --absolute-git-dir)
+        index="$RUNNER_TEMP/compare.index"
+        # Prints the git tree hash of a directory. -f includes files a .gitignore would exclude,
+        # so nothing rendered is silently left out of the comparison.
+        tree_of() {
+          rm -f "$index"
+          GIT_INDEX_FILE=$index git -C "$1" --git-dir="$git_dir" --work-tree="$1" add -A -f .
+          GIT_INDEX_FILE=$index git --git-dir="$git_dir" write-tree
+          rm -f "$index"
+        }
+
+        selected="$RUNNER_TEMP/pull-requests.jsonl"
+        : > "$selected"
+        select_pair() {
+          jq -c --arg number "$1" '. + {"pr-number": ($number | if . == "" then null else tonumber end)}' \
+            <<< "$pair" >> "$selected"
+        }
+        while IFS= read -r pair; do
+          IFS=$'\t' read -r environment name branch manifest_dir source < <(
+            jq -r '[.env, .name, .branch, ."manifest-dir", .source] | @tsv' <<< "$pair")
+          # The charts of an environment without a branch were reported by the previous step
+          if [[ " ${environments[*]-} " != *" $environment "* ]]; then
+            continue
+          fi
+          base="environments/$environment"
+          reference="refs/remotes/origin/$base"
+          number=""
+          if [ "${open_prs[$branch]:-}" = "$base" ]; then
+            reference="refs/remotes/origin/$branch"
+            number=${open_pr_numbers[$branch]}
+            if ! git merge-base --is-ancestor "refs/remotes/origin/$base" "$reference"; then
+              echo "$name/$environment: the open pull request does not build on $base, refreshing it."
+              select_pair "$number"
+              continue
+            fi
+          fi
+          rendered=$(tree_of "$OUTPUT_ROOT/$source")
+          current=$(git rev-parse --verify --quiet "$reference:$manifest_dir" || true)
+          if [ "$rendered" = "$current" ]; then
+            echo "$name/$environment: unchanged against ${reference#refs/remotes/origin/}, skipping."
+          else
+            echo "$name/$environment: changed against ${reference#refs/remotes/origin/}."
+            select_pair "$number"
+          fi
+        done < <(jq -c '.' "$PAIRS_FILE")
+
+        count=$(wc -l < "$selected" | tr -d ' ')
+        echo "count=$count" >> "$GITHUB_OUTPUT"
+        echo "$count pair(s) need a pull request."
+    - name: Create pull requests
+      # Opens (or updates) one pull request per selected chart and environment, in place of
+      # upstream's create-pull-request job and peter-evans/create-pull-request: the manifests are
+      # pushed as one commit on top of the environment branch to the pull request branch, and the
+      # pull request is opened through Gitea's API unless one is open already. A pull request
+      # whose manifests match the environment branch again is closed.
+      #
+      # A failing pair doesn't stop the others, as upstream's matrix jobs don't. Each pair runs in
+      # a subshell with errexit enabled. It mustn't be the condition of an `if` or part of `||`,
+      # where bash ignores errexit, so errexit is turned off around it instead and the status
+      # checked afterwards.
+      if: ${{ !cancelled() && steps.select.outputs.count > 0 }}
+      run: |
+        set -euo pipefail
+        # shellcheck source=/dev/null
+        source "$RUNNER_TEMP/gitea-api.sh"
+
+        create_pull_request() {
+          local pair=$1 environment name branch manifest_dir source version number
+          IFS=$'\t' read -r environment name branch manifest_dir source version number < <(
+            jq -r '[.env, .name, .branch, ."manifest-dir", .source, .version, (."pr-number" // "")] | @tsv' <<< "$pair")
+          local base="environments/$environment" worktree="$RUNNER_TEMP/worktree-$source"
+          local title="💧 [$environment] Hydrated manifests for $name subchart version $version"
+
+          # Only this chart's manifest directory is replaced, so sibling charts sharing the
+          # branch keep their manifests.
+          git worktree add --quiet --detach "$worktree" "refs/remotes/origin/$base"
+          rm -rf "${worktree:?}/$manifest_dir"
+          mkdir -p "$worktree/$manifest_dir"
+          cp -R "$OUTPUT_ROOT/$source/." "$worktree/$manifest_dir/"
+          git -C "$worktree" add -A -f -- "$manifest_dir"
+          if git -C "$worktree" diff --cached --quiet; then
+            git worktree remove --force "$worktree"
+            if [ -n "$number" ]; then
+              echo "$base holds these manifests already, closing pull request #$number."
+              api PATCH "/pulls/$number" -d '{"state": "closed"}' > /dev/null
+            fi
+            return 0
+          fi
+          git -C "$worktree" commit --quiet -m "$title"
+          git -C "$worktree" push --quiet --force origin "HEAD:refs/heads/$branch"
+          git worktree remove --force "$worktree"
+
+          if [ -n "$number" ]; then
+            echo "Updated pull request #$number."
+            return 0
+          fi
+          local labels body url
+          labels=$(jq -c --arg environment "env: $environment" \
+            '[.hydration, ."automated pr", .[$environment]] | map(select(. != null))' \
+            "$RUNNER_TEMP/labels.json")
+          body=$(jq -n --arg head "$branch" --arg base "$base" --arg title "$title" \
+            --argjson labels "$labels" \
+            --arg body "Rendered by the helm hydration workflow from $REPOSITORY@${GITHUB_SHA:0:12}." \
+            '{head: $head, base: $base, title: $title, body: $body, labels: $labels}')
+          url=$(api POST /pulls -d "$body" | jq -r '.html_url')
+          echo "Opened $url"
+        }
+
+        failed=()
+        while IFS= read -r pair; do
+          pair_name=$(jq -r '"\(.name) for \(.env)"' <<< "$pair")
+          echo "::group::Create the pull request of $pair_name"
+          set +e
+          (
+            set -e
+            create_pull_request "$pair"
+          ) < /dev/null
+          status=$?
+          set -e
+          echo "::endgroup::"
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Could not create the pull request of $pair_name."
+            failed+=("$pair_name")
+          fi
+        done < "$RUNNER_TEMP/pull-requests.jsonl"
+
+        if [ "${#failed[@]}" -gt 0 ]; then
+          printf '::error::Creating the pull request failed for %s\n' "${failed[@]}"
+          exit 1
+        fi
