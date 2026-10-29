@@ -443,6 +443,13 @@ jobs:
         metadata="$RUNNER_TEMP/chart-metadata.json"
         failed=()
         while IFS= read -r chart_dir; do
+          # A preview only needs the charts with its environment
+          if [ -n "$ONLY_ENVIRONMENT" ] &&
+              ! yq -e 'explode(.) | .environments | has(strenv(ONLY_ENVIRONMENT))' \
+                "$chart_dir/helm-config.yaml" > /dev/null 2>&1; then
+            echo "$chart_dir has no environment $ONLY_ENVIRONMENT, skipping it."
+            continue
+          fi
           echo "::group::Install the dependencies of $chart_dir"
           if ! run prepare_chart "$chart_dir" "$metadata"; then
             echo "::endgroup::"
@@ -822,6 +829,8 @@ jobs:
       # Force-pushes the rendered environment to the preview branch as one orphan commit, laid
       # out like the environment branch, so the branch always holds the manifests of the latest
       # push. Only when every chart rendered: a partial preview would look like a complete one.
+      # Nor when the branch has moved on or was deleted during the run: a newer run publishes
+      # instead, or the preview stays deleted.
       if: ${{ steps.mode.outputs.mode == 'preview' && steps.hydrate.outputs.hydrated == 'true' }}
       env:
         ACTOR: ${{ github.actor }}
@@ -847,5 +856,15 @@ jobs:
         GIT_INDEX_FILE=$index git -C "$tree_dir" --git-dir="$git_dir" --work-tree="$tree_dir" add -A -f .
         tree=$(GIT_INDEX_FILE=$index git --git-dir="$git_dir" write-tree)
         commit=$(git commit-tree "$tree" -m "Preview of $REPOSITORY@${GITHUB_SHA:0:12} (${GITHUB_REF#refs/heads/})")
+
+        # ls-remote matches patterns by their end, hence the exact comparison
+        head=$(git ls-remote origin "$GITHUB_REF" | awk -v ref="$GITHUB_REF" '$2 == ref { print $1 }')
+        if [ -z "$head" ]; then
+          echo "${GITHUB_REF#refs/heads/} was deleted during this run, not publishing $PREVIEW_BRANCH."
+          exit 0
+        elif [ "$head" != "$GITHUB_SHA" ]; then
+          echo "${GITHUB_REF#refs/heads/} moved on to ${head:0:12} during this run, its run publishes $PREVIEW_BRANCH."
+          exit 0
+        fi
         git push --quiet --force origin "$commit:refs/heads/$PREVIEW_BRANCH" < /dev/null
         echo "Published $PREVIEW_BRANCH. An Argo CD Application follows it with targetRevision: $PREVIEW_BRANCH"
