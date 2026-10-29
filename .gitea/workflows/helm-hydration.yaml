@@ -157,8 +157,9 @@ jobs:
         fi
         PREVIEW_BRANCH="preview/$PREVIEW_ENVIRONMENT/$branch"
         # Slashes in the branch name are part of the path
+        preview_path=$(jq -rn --arg branch "$PREVIEW_BRANCH" '$branch | split("/") | map(@uri) | join("/")')
         status=$(curl --silent --show-error -o /dev/null -w '%{http_code}' -X DELETE \
-          -H "Authorization: token $TOKEN" "$API/branches/$PREVIEW_BRANCH")
+          -H "Authorization: token $TOKEN" "$API/branches/$preview_path")
         case $status in
           204) echo "Deleted $PREVIEW_BRANCH." ;;
           404) echo "No preview $PREVIEW_BRANCH to delete." ;;
