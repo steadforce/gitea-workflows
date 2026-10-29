@@ -444,11 +444,17 @@ jobs:
         failed=()
         while IFS= read -r chart_dir; do
           # A preview only needs the charts with its environment
-          if [ -n "$ONLY_ENVIRONMENT" ] &&
-              ! yq -e 'explode(.) | .environments | has(strenv(ONLY_ENVIRONMENT))' \
-                "$chart_dir/helm-config.yaml" > /dev/null 2>&1; then
-            echo "$chart_dir has no environment $ONLY_ENVIRONMENT, skipping it."
-            continue
+          if [ -n "$ONLY_ENVIRONMENT" ]; then
+            if ! has_environment=$(yq 'explode(.) | .environments | has(strenv(ONLY_ENVIRONMENT))' \
+                "$chart_dir/helm-config.yaml"); then
+              echo "::error::Could not read the environments of $chart_dir."
+              failed+=("$chart_dir")
+              continue
+            fi
+            if [ "$has_environment" != true ]; then
+              echo "$chart_dir has no environment $ONLY_ENVIRONMENT, skipping it."
+              continue
+            fi
           fi
           echo "::group::Install the dependencies of $chart_dir"
           if ! run prepare_chart "$chart_dir" "$metadata"; then
