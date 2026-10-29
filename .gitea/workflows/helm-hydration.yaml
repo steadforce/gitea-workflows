@@ -23,6 +23,10 @@
 #   • The pull request body, the commit message and the commit author are set by this workflow,
 #     where upstream leaves peter-evans/create-pull-request's defaults.
 #   • No `upload-artifact` input.
+#   • Previews: a push to another branch than the default branch renders the environment named by
+#     `preview-environment` only, onto `preview/<environment>/<branch>`, and deleting the branch
+#     deletes its preview. Pull requests are only opened for the default branch, and pushes to
+#     Renovate's branches are skipped.
 #
 # Like upstream it runs on the runner's `ubuntu-latest` image, uses actions/checkout and
 # azure/setup-helm, and takes yq, jq and curl from the image, e.g. gitea/runner-images. The
@@ -60,6 +64,10 @@
 #                          `hydrated-manifests/<chart name>`.
 #   Pull request         – One PR per changed chart and environment targeting
 #                          `environments/<name>`, from `hydration-pull-request/<name>[-<chart>]-<version>`.
+#   Preview branch       – `preview/<environment>/<branch>` for a push to another branch than the
+#                          default branch, with `preview-environment` set: one orphan commit with
+#                          the environment's hydrated-manifests/, replaced on every push, e.g. for
+#                          a local cluster to follow the branch.
 #
 # Token
 # -----
@@ -99,13 +107,71 @@ on:
         description: "Push the hydrated manifests to the environment branch and open a pull request."
         default: true
         type: boolean
+      preview-environment:
+        # A push to another branch than the default branch renders only this environment and
+        # publishes it on `preview/<environment>/<branch>`, without a pull request. Deleting the
+        # branch deletes its preview, when the caller also triggers on `delete`.
+        description: "Environment to preview for pushes to other branches than the default branch, empty for none."
+        default: ""
+        type: string
+      renovate-branch-prefix:
+        # Pushes to Renovate's branches are skipped: their pull requests are checked, and their
+        # changes reach the environments through the default branch. Renovate's `branchPrefix`.
+        description: "Prefix of Renovate's branches, whose pushes are skipped. Empty skips none."
+        default: "renovate/"
+        type: string
     secrets:
       token:
         description: "Token to push and to open pull requests with, defaults to the job token."
         required: false
 
 jobs:
+  delete-preview:
+    # Deletes the preview of a deleted branch, if there is one
+    if: ${{ github.event_name == 'delete' && github.event.ref_type == 'branch' && inputs.preview-environment != '' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Delete the preview branch
+      env:
+        TOKEN: ${{ secrets.token || github.token }}
+        API: ${{ github.server_url }}/api/v1/repos/${{ github.repository }}
+        DELETED_REF: ${{ github.event.ref }}
+        PREVIEW_ENVIRONMENT: ${{ inputs.preview-environment }}
+        RENOVATE_PREFIX: ${{ inputs.renovate-branch-prefix }}
+      run: |
+        set -euo pipefail
+        # Gitea's ref is refs/heads/<branch>, GitHub's the branch alone
+        branch=${DELETED_REF#refs/heads/}
+        # This workflow's own branches and Renovate's never have a preview
+        case $branch in
+          environments/* | hydration-pull-request/* | preview/*)
+            echo "$branch is a branch of this workflow, it has no preview." && exit 0 ;;
+        esac
+        if [ -n "$RENOVATE_PREFIX" ] && [[ $branch == "$RENOVATE_PREFIX"* ]]; then
+          echo "$branch is Renovate's, it has no preview." && exit 0
+        fi
+        PREVIEW_BRANCH="preview/$PREVIEW_ENVIRONMENT/$branch"
+        # Slashes in the branch name are part of the path
+        preview_path=$(jq -rn --arg branch "$PREVIEW_BRANCH" '$branch | split("/") | map(@uri) | join("/")')
+        status=$(curl --silent --show-error -o /dev/null -w '%{http_code}' -X DELETE \
+          -H "Authorization: token $TOKEN" "$API/branches/$preview_path")
+        case $status in
+          204) echo "Deleted $PREVIEW_BRANCH." ;;
+          404) echo "No preview $PREVIEW_BRANCH to delete." ;;
+          *) echo "::error::Deleting $PREVIEW_BRANCH returned $status." && exit 1 ;;
+        esac
+
   hydrate:
+    # Not for deleted branches, nor for pushes to Renovate's
+    if: >-
+      ${{ github.event_name != 'delete' && !(github.event_name == 'push' &&
+      inputs.renovate-branch-prefix != '' &&
+      startsWith(github.ref, format('refs/heads/{0}', inputs.renovate-branch-prefix))) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -120,6 +186,43 @@ jobs:
       SERVER_URL: ${{ github.server_url }}
       REPOSITORY: ${{ github.repository }}
     steps:
+    - name: Choose what to publish
+      # pull-request: the default branch, with create-pull-request, opens pull requests to the
+      #               environment branches.
+      # preview:      a push to another branch, with preview-environment, publishes that
+      #               environment on preview/<environment>/<branch>.
+      # render:       anything else only renders, as a check.
+      #
+      # Gitea's runner passes a boolean input set by an expression in the caller, such as
+      # `${{ github.event_name == 'push' }}`, as the string "false", which is truthy on its own,
+      # hence the comparison as a string.
+      id: mode
+      env:
+        EVENT: ${{ github.event_name }}
+        REF: ${{ github.ref }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        CREATE_PULL_REQUEST: ${{ inputs.create-pull-request }}
+        PREVIEW_ENVIRONMENT: ${{ inputs.preview-environment }}
+      run: |
+        set -euo pipefail
+        mode=render
+        branch=""
+        if [[ $REF == refs/heads/* ]]; then
+          branch=${REF#refs/heads/}
+        fi
+        if [ -n "$branch" ] && [ "$branch" = "$DEFAULT_BRANCH" ]; then
+          if [ "$CREATE_PULL_REQUEST" = true ]; then
+            mode=pull-request
+          fi
+        elif [[ $branch == environments/* || $branch == hydration-pull-request/* || $branch == preview/* ]]; then
+          # This workflow's own branches only hold manifests, they never get a preview
+          mode=render
+        elif [ "$EVENT" = push ] && [ -n "$branch" ] && [ -n "$PREVIEW_ENVIRONMENT" ]; then
+          mode=preview
+          echo "preview-branch=preview/$PREVIEW_ENVIRONMENT/$branch" >> "$GITHUB_OUTPUT"
+        fi
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+        echo "Mode: $mode (event $EVENT, ref $REF, default branch $DEFAULT_BRANCH)"
     - name: Checkout repository
       # With the token that later pushes the environment and pull request branches, since
       # checkout keeps it configured for git
@@ -188,11 +291,14 @@ jobs:
       #                  rendering of resources that depend on CRDs or optional APIs.
       #   valueFiles   – Values files for the current environment, passed via `-f`. The paths
       #                  are relative to the chart directory.
+      #
+      # A preview renders its environment only, and skips charts without it.
       id: hydrate
       env:
         MULTI_CHART: ${{ steps.discover.outputs.multi-chart }}
         BUNDLE_PATCHES: ${{ inputs.bundle-patches-in-one-pr }}
         REGISTERED_REPOSITORIES: ${{ runner.temp }}/helm-repositories.txt
+        ONLY_ENVIRONMENT: ${{ steps.mode.outputs.mode == 'preview' && inputs.preview-environment || '' }}
       run: |
         set -uo pipefail
 
@@ -337,6 +443,19 @@ jobs:
         metadata="$RUNNER_TEMP/chart-metadata.json"
         failed=()
         while IFS= read -r chart_dir; do
+          # A preview only needs the charts with its environment
+          if [ -n "$ONLY_ENVIRONMENT" ]; then
+            if ! has_environment=$(yq 'explode(.) | .environments | has(strenv(ONLY_ENVIRONMENT))' \
+                "$chart_dir/helm-config.yaml"); then
+              echo "::error::Could not read the environments of $chart_dir."
+              failed+=("$chart_dir")
+              continue
+            fi
+            if [ "$has_environment" != true ]; then
+              echo "$chart_dir has no environment $ONLY_ENVIRONMENT, skipping it."
+              continue
+            fi
+          fi
           echo "::group::Install the dependencies of $chart_dir"
           if ! run prepare_chart "$chart_dir" "$metadata"; then
             echo "::endgroup::"
@@ -349,6 +468,9 @@ jobs:
           release_name=$(jq -r '."release-name"' "$metadata")
           namespace=$(jq -r '.namespace' "$metadata")
           while IFS= read -r environment; do
+            if [ -n "$ONLY_ENVIRONMENT" ] && [ "$environment" != "$ONLY_ENVIRONMENT" ]; then
+              continue
+            fi
             source="hydrated-$chart_name-$environment"
             echo "::group::Hydrate $chart_name for $environment"
             if run render_environment "$chart_dir" "$release_name" "$namespace" "$OUTPUT_ROOT/$source" "$environment"; then
@@ -385,12 +507,8 @@ jobs:
       #
       # An environment whose branch can't be created fails this step at the end, and its charts
       # are skipped by the next steps. A label that can't be created only warns.
-      #
-      # Gitea's runner passes a boolean input set by an expression in the caller, such as
-      # `${{ github.event_name == 'push' }}`, as the string "false", which is truthy on its own,
-      # hence the explicit comparison of `create-pull-request`.
       id: prepare
-      if: ${{ !cancelled() && steps.hydrate.outputs.hydrated == 'true' && (inputs.create-pull-request == true || inputs.create-pull-request == 'true') }}
+      if: ${{ !cancelled() && steps.hydrate.outputs.hydrated == 'true' && steps.mode.outputs.mode == 'pull-request' }}
       env:
         ACTOR: ${{ github.actor }}
       run: |
@@ -553,7 +671,7 @@ jobs:
       #
       # Runs even when Prepare environment branches failed, for the environments it prepared.
       id: select
-      if: ${{ !cancelled() && steps.hydrate.outputs.hydrated == 'true' && (inputs.create-pull-request == true || inputs.create-pull-request == 'true') }}
+      if: ${{ !cancelled() && steps.hydrate.outputs.hydrated == 'true' && steps.mode.outputs.mode == 'pull-request' }}
       run: |
         set -euo pipefail
         # shellcheck source=/dev/null
@@ -713,3 +831,46 @@ jobs:
           printf '::error::Creating the pull request failed for %s\n' "${failed[@]}"
           exit 1
         fi
+    - name: Publish the preview
+      # Force-pushes the rendered environment to the preview branch as one orphan commit, laid
+      # out like the environment branch, so the branch always holds the manifests of the latest
+      # push. Only when every chart rendered: a partial preview would look like a complete one.
+      # Nor when the branch has moved on or was deleted during the run: a newer run publishes
+      # instead, or the preview stays deleted.
+      if: ${{ steps.mode.outputs.mode == 'preview' && steps.hydrate.outputs.hydrated == 'true' }}
+      env:
+        ACTOR: ${{ github.actor }}
+        PREVIEW_BRANCH: ${{ steps.mode.outputs.preview-branch }}
+      run: |
+        set -euo pipefail
+        host=${SERVER_URL#*://}
+        host=${host%%/*}
+        export GIT_AUTHOR_NAME="$ACTOR" GIT_COMMITTER_NAME="$ACTOR"
+        export GIT_AUTHOR_EMAIL="$ACTOR@noreply.${host%%:*}" GIT_COMMITTER_EMAIL="$ACTOR@noreply.${host%%:*}"
+
+        tree_dir="$RUNNER_TEMP/preview"
+        mkdir -p "$tree_dir"
+        while IFS=$'\t' read -r manifest_dir source; do
+          mkdir -p "$tree_dir/$manifest_dir"
+          cp -R "$OUTPUT_ROOT/$source/." "$tree_dir/$manifest_dir/"
+        done < <(jq -r '[."manifest-dir", .source] | @tsv' "$PAIRS_FILE")
+
+        # A throwaway index, so the checkout stays untouched. -f includes files a .gitignore
+        # would exclude.
+        git_dir=$(git rev-parse --absolute-git-dir)
+        index="$RUNNER_TEMP/preview.index"
+        GIT_INDEX_FILE=$index git -C "$tree_dir" --git-dir="$git_dir" --work-tree="$tree_dir" add -A -f .
+        tree=$(GIT_INDEX_FILE=$index git --git-dir="$git_dir" write-tree)
+        commit=$(git commit-tree "$tree" -m "Preview of $REPOSITORY@${GITHUB_SHA:0:12} (${GITHUB_REF#refs/heads/})")
+
+        # ls-remote matches patterns by their end, hence the exact comparison
+        head=$(git ls-remote origin "$GITHUB_REF" | awk -v ref="$GITHUB_REF" '$2 == ref { print $1 }')
+        if [ -z "$head" ]; then
+          echo "${GITHUB_REF#refs/heads/} was deleted during this run, not publishing $PREVIEW_BRANCH."
+          exit 0
+        elif [ "$head" != "$GITHUB_SHA" ]; then
+          echo "${GITHUB_REF#refs/heads/} moved on to ${head:0:12} during this run, its run publishes $PREVIEW_BRANCH."
+          exit 0
+        fi
+        git push --quiet --force origin "$commit:refs/heads/$PREVIEW_BRANCH" < /dev/null
+        echo "Published $PREVIEW_BRANCH. An Argo CD Application follows it with targetRevision: $PREVIEW_BRANCH"
