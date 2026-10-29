@@ -25,9 +25,10 @@ name: Helm hydration
 
 on:
   pull_request:
+  # main opens pull requests, every other branch gets a preview, Renovate's are skipped
   push:
-    branches:
-    - main
+  # Deletes the preview of a deleted branch
+  delete:
 
 # For the job token, from Gitea 1.26 on
 permissions:
@@ -37,12 +38,14 @@ permissions:
 
 jobs:
   hydration:
-    uses: https://github.com/steadforce/gitea-workflows/.gitea/workflows/helm-hydration.yaml@v0.1.0
+    uses: https://github.com/steadforce/gitea-workflows/.gitea/workflows/helm-hydration.yaml@v0.2.0
     with:
       # Pinned, so a new Helm release can't change the manifests without a commit
       helm-version: v4.2.1
       # Render only on pull requests, as a check; push and open pull requests on main
       create-pull-request: ${{ github.event_name == 'push' }}
+      # Pushes to other branches publish this environment on preview/local/<branch>
+      preview-environment: local
     # Before Gitea 1.26 only, instead of permissions: a bot token, see Setup
     # secrets:
     #   token: ${{ secrets.HYDRATION_TOKEN }}
@@ -51,6 +54,17 @@ jobs:
 Every environment in `helm-config.yaml` is rendered into `hydrated-manifests/` on the branch
 `environments/<environment>`, through a pull request from
 `hydration-pull-request/<environment>[-<chart>]-<version>`.
+
+A push to any other branch, with `preview-environment` set, renders that environment only and
+publishes it on `preview/<environment>/<branch>`, e.g. `preview/local/feature/kafka` for
+`feature/kafka`, without a pull request. A local Argo CD Application follows the branch with
+`targetRevision: preview/local/feature/kafka`. The preview is one commit with the same layout as
+`environments/<environment>`, replaced on every push, and deleted with its branch.
+
+Pushes to Renovate's branches are skipped (`renovate-branch-prefix`, Renovate's default
+`branchPrefix`): their pull requests are checked, and their changes reach the environments
+through `main`. This workflow's own branches, `environments/*`, `hydration-pull-request/*` and
+`preview/*`, hold manifests only, without a workflow, so pushes to them don't start it at all.
 
 ```yaml
 # helm-config.yaml
@@ -74,7 +88,9 @@ environments:
 | `bundle-patches-in-one-pr` | Group patch-level subchart updates into one PR per minor version | `true` |
 | `charts-root` | Directory the chart search starts from | `.` |
 | `chart-discovery-depth` | Maximum search depth for `helm-config.yaml` below `charts-root` | `1` |
-| `create-pull-request` | Push to the environment branch and open a PR. `false` renders only | `true` |
+| `create-pull-request` | Push to the environment branch and open a PR, for the default branch. `false` renders only | `true` |
+| `preview-environment` | Environment a push to another branch publishes on `preview/<environment>/<branch>`. Empty for none | `""` |
+| `renovate-branch-prefix` | Prefix of Renovate's branches, whose pushes are skipped. Empty skips none | `renovate/` |
 
 ### Setup
 
@@ -99,6 +115,9 @@ environments:
 | Event | Result |
 |---|---|
 | Pull request | Renders every chart and environment as a check; pushes nothing |
+| Push to another branch, `preview-environment` set | Renders that environment, force-pushes it to `preview/<environment>/<branch>` |
+| Push to a Renovate branch | Nothing, its pull request is checked |
+| Branch deleted, `preview-environment` set | Deletes `preview/<environment>/<branch>` |
 | Push to `main`, manifests changed | Opens a pull request to `environments/<environment>`, or updates the open one |
 | Push to `main`, manifests unchanged | Nothing |
 | Manifests back to what `environments/<environment>` holds | Closes the open pull request |
