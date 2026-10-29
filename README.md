@@ -29,6 +29,12 @@ on:
     branches:
     - main
 
+# For the job token, from Gitea 1.26 on
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
 jobs:
   hydration:
     uses: https://github.com/steadforce/gitea-workflows/.gitea/workflows/helm-hydration.yaml@v0.1.0
@@ -37,9 +43,9 @@ jobs:
       helm-version: v4.2.1
       # Render only on pull requests, as a check; push and open pull requests on main
       create-pull-request: ${{ github.event_name == 'push' }}
-    secrets:
-      # Bot token, needed before Gitea 28, see Setup
-      token: ${{ secrets.HYDRATION_TOKEN }}
+    # Before Gitea 1.26 only, instead of permissions: a bot token, see Setup
+    # secrets:
+    #   token: ${{ secrets.HYDRATION_TOKEN }}
 ```
 
 Every environment in `helm-config.yaml` is rendered into `hydrated-manifests/` on the branch
@@ -73,18 +79,15 @@ environments:
 ### Setup
 
 - **Token**: the workflow pushes branches, creates labels and opens pull requests.
-  - **Gitea 1.24**: the job token can push and create labels, but not open pull requests ("user
-    must be a collaborator"). Create a bot user, give it write access to the repositories (e.g.
-    through an organization team), and store a token of it with the scopes `write:repository` and
-    `write:issue` as the organization secret `HYDRATION_TOKEN`.
-  - **Gitea 28** (tested with 28.2.0): the job token opens pull requests itself, so no bot is
-    needed. Leave out `secrets:` and grant the permissions in the caller, as on GitHub:
-    ```yaml
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-    ```
+  - **Gitea 1.26 and later** (tested with 1.26.1 and 28.2.0): the job token does all of it, with
+    the `permissions:` of the caller as in Usage ([#36173](https://github.com/go-gitea/gitea/pull/36173)).
+    No bot is needed. The maximum permissions in the owner's or repository's Settings → Actions →
+    General must allow `write`, which they do unless changed.
+  - **Before Gitea 1.26** (tested with 1.24.5): the job token can push and create labels, but not
+    open pull requests ("user must be a collaborator"). Create a bot user, give it write access to
+    the repositories (e.g. through an organization team), store a token of it with the scopes
+    `write:repository` and `write:issue` as the organization secret `HYDRATION_TOKEN`. Pass it with
+    the commented-out `secrets:` in Usage, instead of `permissions:`.
 - **Runner**: a runner with the label `ubuntu-latest` whose image has bash, git, Node, curl, jq
   and yq, such as Gitea's default `gitea/runner-images:ubuntu-latest`. It needs to reach
   github.com for this repository, `actions/checkout` and `azure/setup-helm`, get.helm.sh for Helm,

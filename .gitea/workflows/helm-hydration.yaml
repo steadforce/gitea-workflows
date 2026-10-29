@@ -20,15 +20,16 @@
 #   • Labels and pull requests go through Gitea's API instead of gh and
 #     peter-evans/create-pull-request, which only work with GitHub. Gitea doesn't create labels
 #     when they are applied, so all of them are created up front.
-#   • A pull request whose manifests match the environment branch again is closed.
+#   • The pull request body, the commit message and the commit author are set by this workflow,
+#     where upstream leaves peter-evans/create-pull-request's defaults.
 #   • No `upload-artifact` input.
 #
 # Like upstream it runs on the runner's `ubuntu-latest` image, uses actions/checkout and
 # azure/setup-helm, and takes yq, jq and curl from the image, e.g. gitea/runner-images. The
 # runner loads the actions from github.com, and setup-helm downloads Helm from get.helm.sh.
 #
-# Gitea specifics (tested with Gitea 1.24.5 and its runner v0.4.1)
-# -------------------------------------------------------------------
+# Gitea specifics (tested with Gitea 1.24.5, 1.26.1 and 28.2.0, runner v0.4.1)
+# -----------------------------------------------------------------------------
 #   • Reference this workflow by tag. The runner caches a called workflow by its ref and doesn't
 #     fetch `@main` again, so a branch ref keeps running an old version.
 #   • The runner runs steps with sh unless told otherwise, hence `shell: bash`.
@@ -62,11 +63,11 @@
 #
 # Token
 # -----
-# The token needs to push branches, and to create labels and pull requests. Gitea 1.24's job token
-# may push and create labels, but not open pull requests ("user must be a collaborator"), so pass
-# the token of a bot user with write access to the repository as the `token` secret there. From
-# Gitea 28 on (tested with 28.2.0) the job token opens pull requests itself, and the secret can be
-# left out.
+# The token needs to push branches, and to create labels and pull requests. From Gitea 1.26 on
+# (tested with 1.26.1 and 28.2.0) the job token does all of it, when the caller grants
+# `contents`, `issues` and `pull-requests: write`, and the secret is left out. Before, the job
+# token may push and create labels, but not open pull requests ("user must be a collaborator"),
+# so pass the token of a bot user with write access to the repository as the `token` secret.
 
 name: Helm hydration
 
@@ -514,7 +515,7 @@ jobs:
           if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null 2>&1; then
             echo "Branch '$branch' already exists on origin."
           else
-            commit=$(git commit-tree "$empty_tree" -m "chore: initialise $branch branch")
+            commit=$(git commit-tree "$empty_tree" -m "chore: initialize $branch branch")
             # A concurrent run may have created the branch in the meantime, which rejects this
             # push but leaves the branch in place.
             if ! git push --quiet origin "$commit:refs/heads/$branch" < /dev/null \
